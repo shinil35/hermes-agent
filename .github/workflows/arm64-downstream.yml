@@ -1,0 +1,204 @@
+name: Fork ARM64 candidate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/arm64-downstream.yml
+      - scripts/arm64/**
+      - tests/scripts/arm64/**
+      - docs/arm64-downstream.md
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Owner-reviewed full SHA in shinil35/hermes-agent (empty uses reviewed pin)
+        type: string
+        default: ''
+      publish:
+        description: Publish tested image (default-branch dispatch only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-arm64-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    if: >-
+      github.repository == 'shinil35/hermes-agent' &&
+      ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+      image_id: ${{ steps.identity.outputs.image_id }}
+      archive_sha: ${{ steps.identity.outputs.archive_sha }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Export fixed public source without credentials
+        id: source
+        env:
+          REQUESTED_SHA: ${{ inputs.source_sha }}
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_SYSTEM: /dev/null
+          GIT_TERMINAL_PROMPT: '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="${REQUESTED_SHA:-$(cat control/scripts/arm64/source-revision)}"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          rm -rf control/.git
+          git -c credential.helper= clone --filter=blob:none --no-checkout --no-tags --single-branch https://github.com/shinil35/hermes-agent.git source
+          git -C source -c credential.helper= fetch --filter=blob:none --no-tags origin "$revision"
+          test "$(git -C source rev-parse FETCH_HEAD)" = "$revision"
+          git -C source -c credential.helper= checkout --detach "$revision"
+          baseline=5b147ab036d6d19131bff8d20701b5001eab844a
+          git -C source merge-base --is-ancestor "$baseline" HEAD
+          if git -C source config --get-regexp 'http.*extraheader|credential' >/dev/null; then exit 1; fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_REVISION=$revision" >> "$GITHUB_ENV"
+          echo "SOURCE_DISTANCE=$(git -C source rev-list --count "$baseline..HEAD")" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE=$(git -C source show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - name: Prepare isolated test dependencies
+        working-directory: source
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+          HERMES_RUNTIME_DIR: ${{ runner.temp }}/hermes-tools
+          UV_CONCURRENT_BUILDS: '2'
+          UV_CONCURRENT_DOWNLOADS: '2'
+        run: python3 -m pm.build_env --source . --out "$RUNNER_TEMP/test-env" --cache "$RUNNER_TEMP/uv-cache" --group dev --group test
+      - name: Required adapter and identity tests then checks
+        working-directory: source
+        env:
+          HERMES_PYTHON: ${{ runner.temp }}/test-env/bin/python
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+          HERMES_RUNTIME_DIR: ${{ runner.temp }}/hermes-tools
+          HERMES_TEST_WORKERS: '2'
+          HERMES_TEST_FILE_RETRIES: '0'
+          HERMES_TEST_FILE_TIMEOUT: '180'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/run_tests.sh tests/gateway/test_local_satellite_cron.py tests/gateway/test_nonmultiplex_cron_routes.py tests/gateway/test_cron_ownership_config_failure.py tests/gateway/test_cron_ownership_layer_snapshot.py tests/gateway/test_cron_ownership_directory.py tests/cron/test_cron_multiplex_shared_route_delivery.py tests/gateway/test_cron_delivery_housekeeping.py tests/gateway/test_multiplex_transport_matrix.py tests/gateway/test_multiplex_adapter_registry.py tests/cron/test_scheduler_provider.py tests/cron/test_cron_multiplex_desktop_ticker_scope.py tests/gateway/test_cron_ticks_every_profile.py tests/gateway/test_cron_profile_gate.py tests/gateway/test_multiplex_phase0.py tests/gateway/test_config_env_bridge_authority.py tests/gateway/test_runtime_config_env_expansion.py tests/gateway/test_platform_env_overrides.py tests/gateway/test_cold_platform_activation.py tests/cron/test_delivery_queue.py tests/cron/test_delivery_queue_retention_race.py tests/cron/test_restart_safe_worker.py tests/cron/test_restart_safe_worker_death_evidence.py
+          "$HERMES_PYTHON" scripts/check --base 5b147ab036d6d19131bff8d20701b5001eab844a
+      - name: Stamp clean build context
+        working-directory: source
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+          HERMES_RUNTIME_DIR: ${{ runner.temp }}/hermes-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/context"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/context"
+          cd "$RUNNER_TEMP/context"
+          "$RUNNER_TEMP/test-env/bin/python" scripts/write_install_stamp.py --output install-stamp.json --commit "$SOURCE_REVISION" --commit-date "$SOURCE_DATE" --branch hermes/arm64-preflight --base-version 0.22.3 --distance "$SOURCE_DISTANCE" --source ci --distribution docker --update-mechanism external
+          python3 - <<'PY'
+          import datetime, json, os
+          from pathlib import Path
+          path = Path('install-stamp.json')
+          stamp = json.loads(path.read_text())
+          stamp['builtAt'] = datetime.datetime.fromtimestamp(int(os.environ['SOURCE_DATE']), datetime.timezone.utc).isoformat()
+          path.write_text(json.dumps(stamp, sort_keys=True) + '\n')
+          PY
+          test ! -e .git
+          test ! -e .env
+      - name: Native build once
+        env:
+          DOCKER_BUILDKIT: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          docker buildx version
+          df -h "$RUNNER_TEMP"
+          docker build --platform linux/arm64 --label "org.opencontainers.image.revision=$SOURCE_REVISION" --label "org.opencontainers.image.source=https://github.com/shinil35/hermes-agent" --label "org.opencontainers.image.version=0.22.3+$SOURCE_DISTANCE" --label "io.hermes.run=$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" -t hermes-arm64:candidate "$RUNNER_TEMP/context"
+      - name: Offline service UID and entrypoint core smoke (browser excluded)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect hermes-arm64:candidate --format '{{.Architecture}}')" = arm64
+          docker run --rm --network none -e HERMES_DISABLE_LAZY_INSTALLS=1 hermes-arm64:candidate --version
+          volume="hermes-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker volume create "$volume"
+          trap 'docker volume rm "$volume" >/dev/null' EXIT
+          docker run --rm --network none -v "$volume:/opt/data" --entrypoint /bin/sh hermes-arm64:candidate -c 'chown 10000:10000 /opt/data'
+          for attempt in 1 2; do
+            docker run --rm --network none --user 10000:10000 -e HERMES_DISABLE_LAZY_INSTALLS=1 -v "$volume:/opt/data" -v "$GITHUB_WORKSPACE/control/scripts/arm64/image_smoke.py:/smoke.py:ro" --entrypoint /opt/hermes/.venv/bin/python hermes-arm64:candidate /smoke.py "$SOURCE_REVISION" "$attempt"
+          done
+      - name: Preserve exact tested image identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/tested"
+          docker save hermes-arm64:candidate | gzip -1 > "$RUNNER_TEMP/tested/image.tar.gz"
+          image_id="$(docker image inspect hermes-arm64:candidate --format '{{.Id}}')"
+          archive_sha="$(sha256sum "$RUNNER_TEMP/tested/image.tar.gz" | cut -d ' ' -f1)"
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          echo "archive_sha=$archive_sha" >> "$GITHUB_OUTPUT"
+          echo "$SOURCE_REVISION $image_id $archive_sha" > "$RUNNER_TEMP/tested/identity.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tested-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/tested/
+          retention-days: 3
+          compression-level: 0
+
+  publish:
+    needs: build
+    if: >-
+      github.repository == 'shinil35/hermes-agent' &&
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish == true
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tested-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tested
+      - name: Verify, load and publish without running source or rebuilding
+        env:
+          REVISION: ${{ needs.build.outputs.revision }}
+          IMAGE_ID: ${{ needs.build.outputs.image_id }}
+          ARCHIVE_SHA: ${{ needs.build.outputs.archive_sha }}
+          GHCR_TOKEN: ${{ github.token }}
+          DOCKER_CONFIG: ${{ runner.temp }}/ghcr-auth
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARCHIVE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "$ARCHIVE_SHA  tested/image.tar.gz" | sha256sum --check
+          test "$(cat tested/identity.txt)" = "$REVISION $IMAGE_ID $ARCHIVE_SHA"
+          docker load -i tested/image.tar.gz
+          test "$(docker image inspect hermes-arm64:candidate --format '{{.Id}}')" = "$IMAGE_ID"
+          test "$(docker image inspect hermes-arm64:candidate --format '{{.Architecture}}')" = arm64
+          test "$(docker image inspect hermes-arm64:candidate --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$REVISION"
+          tag="ghcr.io/shinil35/hermes-agent:sha-$REVISION-run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          trap 'docker logout ghcr.io >/dev/null 2>&1; rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u shinil35 --password-stdin
+          unset GHCR_TOKEN
+          docker tag "$IMAGE_ID" "$tag"
+          docker push "$tag"
+          digest="$(docker buildx imagetools inspect "$tag" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          reference="ghcr.io/shinil35/hermes-agent@$digest"
+          docker buildx imagetools inspect "$reference" --raw > manifest.json
+          test "$(python3 -c 'import json; print(json.load(open("manifest.json"))["config"]["digest"])')" = "$IMAGE_ID"
+          docker pull "$reference"
+          test "$(docker image inspect "$reference" --format '{{.Id}}')" = "$IMAGE_ID"
+          echo "Tested image: $reference (browser automation excluded; no deployment)" >> "$GITHUB_STEP_SUMMARY"
