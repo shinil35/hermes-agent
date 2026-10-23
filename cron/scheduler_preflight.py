@@ -233,6 +233,23 @@ class SharedRouteAdapters:
         return default
 
 
+
+def has_credential_platform(adapters) -> bool:
+    """Only LOCAL is credentialless (liuhao1024, upstream PR #139960)."""
+    return any(
+        str(getattr(platform, "value", platform)).lower() != "local"
+        for platform in (adapters or {})
+    )
+
+
+
+def can_share_profile_adapters(profile, adapters, eligible=None) -> bool:
+    """Keep ownership checks identical for cron ticks and restart-safe queue drains."""
+    return not has_credential_platform(adapters) and (
+        eligible(profile) if callable(eligible) else not adapters
+    )
+
+
 def _preflight_check_delivery(job: dict) -> Optional[str]:
     """Check delivery targets resolve to configured platforms. ``local``/``origin``/``all`` are
     never checked (no gateway-config load). Unknown platform always blocks; known platform blocks

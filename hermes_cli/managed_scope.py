@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import stat
 import threading
 from pathlib import Path
 from typing import Dict, Optional
@@ -42,12 +43,14 @@ def _under_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
-def get_managed_dir() -> Optional[Path]:
+def get_managed_dir(*, strict: bool = False) -> Optional[Path]:
     """Resolve the managed-scope directory, or None when no scope is present.
 
     Priority: ``$HERMES_MANAGED_DIR`` (IT-only bootstrap override; never persisted to any .env;
     honored only when non-empty AND the directory exists), then ``/etc/hermes`` when it exists.
     A missing directory resolves to None — the common case, so it must be cheap + side-effect-free.
+    Ownership probes opt into *strict*: unavailable, dangling or non-directory candidates raise;
+    ordinary callers retain the forgiving presence check.
     """
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
@@ -56,7 +59,19 @@ def get_managed_dir() -> Optional[Path]:
         return None
     else:
         p = _DEFAULT_MANAGED_DIR
-    return p if p.is_dir() else None
+    if not strict:
+        return p if p.is_dir() else None
+    try:
+        mode = p.stat().st_mode
+    except FileNotFoundError:
+        try:
+            p.lstat()
+        except FileNotFoundError:
+            return None  # Truly absent; lstat errors must not become evidence of absence.
+        raise  # An authored dangling link is unavailable, not an absent managed scope.
+    if not stat.S_ISDIR(mode):
+        raise NotADirectoryError(f"Managed scope is not a directory: {p}")
+    return p
 
 
 def invalidate_managed_cache() -> None:

@@ -225,7 +225,7 @@ def _enable_plugin_platform(config: GatewayConfig, entry) -> None:
             )
 
 
-def _configured_plugin_entries(config: GatewayConfig) -> list:
+def _configured_plugin_entries(config: GatewayConfig, *, env_names: Optional[set[str]] = None) -> list:
     """Plugin entries with activation evidence (config block, env/.env, credential pool); only those
     are imported — an unconfigured adapter has nothing to enable. See gateway.platform_activation.
     config.yaml blocks already materialized their adapters in load_yaml_layer (and every merged
@@ -235,13 +235,16 @@ def _configured_plugin_entries(config: GatewayConfig) -> list:
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
         from gateway.platform_activation import configured_plugin_entries
-        return configured_plugin_entries(platform_registry, yaml_cfg={}, platform_names=config.platforms)
+        return configured_plugin_entries(platform_registry, yaml_cfg={}, platform_names=config.platforms,
+                                         env_names=env_names)
     except Exception as e:  # health: allow BLE001 -- moved from the plugin pass: discovery never breaks config load
         logger.debug("Plugin platform discovery for env overrides failed: %s", e)
         return []
 
 
-def _bundled_env_fallbacks(config: GatewayConfig, entries: list) -> list:
+def _bundled_env_fallbacks(
+    config: GatewayConfig, entries: list, *, env_names: Optional[set[str]] = None,
+) -> list:
     """Env rows of bundled platforms with activation evidence but no registry entry (discovery
     suppressed or the plugin disabled), read from their ``gateway_env`` files; see
     ``gateway.platform_env.bundled_env_rows``. They only run the env steps, never the enable pass."""
@@ -252,7 +255,7 @@ def _bundled_env_fallbacks(config: GatewayConfig, entries: list) -> list:
     names = (set(Platform._scan_bundled_plugin_platforms()[0]) | set(_BUNDLED_ENV_SIBLINGS)) - have
     if not names:
         return []
-    wanted = activation_predicate(yaml_cfg={}, platform_names=config.platforms)
+    wanted = activation_predicate(yaml_cfg={}, platform_names=config.platforms, env_names=env_names)
     out = []
     for name in sorted(names):
         rows = bundled_env_rows(name) if wanted(name) else None
@@ -349,15 +352,15 @@ def _scrub_explicit_markers(config: GatewayConfig) -> None:
         platform_config.extra.pop("_enabled_explicit", None)
 
 
-def _apply_env_overrides(config: GatewayConfig) -> None:
+def _apply_env_overrides(config: GatewayConfig, *, env_names: Optional[set[str]] = None) -> None:
     """Apply environment variable overrides to *config*.
 
     Order: plugin platforms' declared env rows, then the core-only rows (api_server, webhook,
     msgraph_webhook; each touches only its own platform), then the registry enable pass, relay
     disabling (needs every platform's final ``enabled``), and the marker scrub, which must be last.
     """
-    entries = _configured_plugin_entries(config)
-    _apply_plugin_env_overrides(config, entries + _bundled_env_fallbacks(config, entries))
+    entries = _configured_plugin_entries(config, env_names=env_names)
+    _apply_plugin_env_overrides(config, entries + _bundled_env_fallbacks(config, entries, env_names=env_names))
     _api_server(config)
     _webhook(config)
     _msgraph_webhook(config)

@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import os
+import stat
 from pathlib import Path
 from typing import Any, Optional
 
@@ -517,9 +518,16 @@ def read_yaml_layers(home: Path) -> dict:
     return managed_scope.apply_managed_overlay(yaml_cfg)
 
 
-def load_yaml_layer(home: Path, gw_data: dict) -> None:
-    """Overlay ``read_yaml_layers`` onto *gw_data* in place. Raises on any failure (caller warns + falls back)."""
-    yaml_cfg = read_yaml_layers(home)
+def load_yaml_layer(
+    home: Path, gw_data: dict, *, yaml_cfg: Optional[dict] = None,
+    managed_cfg: Optional[dict] = None, env_names: Optional[set[str]] = None,
+) -> None:
+    """Overlay YAML in place; ownership callers supply validated YAML/managed/env snapshots.
+
+    Omitted snapshots retain the startup loader's existing forgiving readers.
+    """
+    if yaml_cfg is None:
+        yaml_cfg = read_yaml_layers(home)
     if not yaml_cfg:
         return
 
@@ -542,16 +550,120 @@ def load_yaml_layer(home: Path, gw_data: dict) -> None:
     if registry is not None:
         from gateway.platform_activation import activation_predicate
         entries = registry.configured_entries(activation_predicate(
-            yaml_cfg=yaml_cfg, platform_names=platforms_data, home=home, registry=registry))
+            yaml_cfg=yaml_cfg, platform_names=platforms_data, home=home, registry=registry,
+            env_names=env_names))
     targets = shared_loop_targets(registry, None if entries is None else [e for e in entries if e.source == "plugin"])
     # "Authored" is config.yaml only: a scratch merge leaves out the legacy gateway.json extra
     # already in ``platforms_data``, which stays the base layer every config.yaml key overrides.
     authored = snapshot_authored_extra(merge_platform_sections(yaml_cfg, gateway_section, {}))
     from hermes_cli import managed_scope
-    managed_extra = _apply_managed_extra(authored, managed_scope.apply_managed_overlay({}), platforms_data)
+    if managed_cfg is None:
+        managed_cfg = managed_scope.apply_managed_overlay({})
+    managed_extra = _apply_managed_extra(authored, managed_cfg, platforms_data)
     warned: set = set()  # one warning per conflicting (platform, key) across both copy sites
     bridge_platform_shared_keys(
         yaml_cfg, gateway_platforms, gw_data, platforms_data, targets, warned=warned, authored=authored)
     apply_plugin_yaml_hooks(yaml_cfg, gateway_platforms, platforms_data, registry,
                             warned=warned, authored=authored, managed_extra=managed_extra, entries=entries)
     bridge_core_env_settings(yaml_cfg, platforms_data)
+
+
+def _read_ownership_mapping(path: Path, parse) -> dict:
+    """An absent layer is supported; a failed or non-mapping read is not an empty layer."""
+    try:
+        with open(path, encoding="utf-8-sig") as stream:
+            data = parse(stream)
+    except FileNotFoundError:
+        _require_ownership_layer_absence(path)
+        return {}
+    if data is None:
+        return {}  # A genuinely empty YAML document is supported by the ordinary loader.
+    if not isinstance(data, dict):
+        raise ValueError("Ownership config must be a mapping")
+    gateway = data.get("gateway", {})
+    if not isinstance(gateway, dict):
+        raise ValueError("Ownership gateway section must be a mapping")
+    for section in (data, gateway):
+        platforms = section.get("platforms", {})
+        if not isinstance(platforms, dict) or any(not isinstance(v, dict) for v in platforms.values()):
+            raise ValueError("Ownership platform sections must be mappings")
+        if any(_is_platform_name(k) and not isinstance(v, dict) for k, v in section.items()):
+            raise ValueError("Ownership platform shorthand must be a mapping")
+    return data
+
+
+def load_ownership_config(home: Path):
+    """Resolve uncached connector ownership without the startup loader's forgiving fallback.
+
+    Reuse its YAML bridge and env/validation phases on one successfully read snapshot of
+    every config layer. Do not validate then call load_gateway_config to re-read the files.
+    This is a local admission boundary, not a new global loader mode or config cache.
+    """
+    from agent.secret_scope import reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope
+    from gateway.config import GatewayConfig, _validate_gateway_config
+    from gateway.config_env import _apply_env_overrides
+    from hermes_cli.config import _deep_merge, _expand_env_vars
+    from hermes_cli.managed_scope import get_managed_dir
+    from utils import fast_safe_load
+
+    if not stat.S_ISDIR(home.stat().st_mode):
+        raise ValueError("Ownership profile home is unavailable")
+    gw_data = _read_ownership_mapping(home / "gateway.json", json.load)
+    user = _read_ownership_mapping(home / "config.yaml", fast_safe_load)
+    managed_dir = get_managed_dir(strict=True)
+    managed = (_read_ownership_mapping(managed_dir / "config.yaml", fast_safe_load)
+               if managed_dir is not None else {})
+    secrets = _ownership_secrets(home, managed_dir)
+    token = set_secret_scope(secrets, profile_home=str(home))
+    try:
+        # Expand and bridge the same snapshots; no later forgiving read may erase ownership.
+        managed = _expand_env_vars(managed)
+        yaml_cfg = _deep_merge(_expand_env_vars(user), managed)
+        env_names = {k for k, v in secrets.items() if str(v).strip()}
+        # YAML hooks must only seed config.extra, never the process environment, for this probe.
+        bridge_token = set_multiplex_context(True)
+        try:
+            load_yaml_layer(home, gw_data, yaml_cfg=yaml_cfg, managed_cfg=managed, env_names=env_names)
+        finally:
+            reset_multiplex_context(bridge_token)
+        config = GatewayConfig.from_dict(gw_data)
+        _apply_env_overrides(config, env_names=env_names)
+        _validate_gateway_config(config)
+        return config
+    finally:
+        reset_secret_scope(token)
+
+
+def _read_ownership_env(path: Path) -> dict[str, str]:
+    """Use the canonical tokenizer on successfully read bytes, without its forgiving I/O fallback."""
+    from agent.secret_scope import _decode_env_bytes, _parse_env_text
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read()
+    except FileNotFoundError:
+        _require_ownership_layer_absence(path)
+        return {}
+    return _parse_env_text(_decode_env_bytes(raw))
+
+
+def _ownership_secrets(home: Path, managed_dir: Optional[Path]) -> dict[str, str]:
+    """Mirror profile secret precedence on reliable file reads and the existing external snapshot."""
+    from agent.secret_scope import _is_global_env
+    from hermes_cli.env_loader import get_secret_source_values
+    secrets = _read_ownership_env(home / ".env")
+    secrets.update((k, v) for k, v in get_secret_source_values(home).items() if not _is_global_env(k))
+    if managed_dir is not None:
+        secrets.update((k, v) for k, v in _read_ownership_env(managed_dir / ".env").items()
+                       if not _is_global_env(k))
+    return secrets
+
+
+def _require_ownership_layer_absence(path: Path) -> None:
+    """A missing file is safe only in an available directory, with no authored dangling entry."""
+    if not stat.S_ISDIR(path.parent.stat().st_mode):
+        raise NotADirectoryError(f"Ownership layer parent unavailable: {path.parent}")
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise FileNotFoundError(f"Ownership layer unavailable: {path}")

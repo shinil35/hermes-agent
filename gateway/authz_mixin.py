@@ -224,9 +224,11 @@ class GatewayAuthorizationMixin:
         profile_adapters = self._profile_adapters_map()
         if profile_name in profile_adapters:
             adapters = profile_adapters[profile_name]
-            if adapters or not self._is_shared_bot_satellite(profile_name):
+            from cron.scheduler_preflight import has_credential_platform
+            if has_credential_platform(adapters) or not self._is_shared_bot_satellite(profile_name):
                 return adapters
-            return self._primary_adapters()
+            # Adapted from liuhao1024's PR #139960: keep the Desktop LOCAL adapter.
+            return {**self._primary_adapters(), **adapters}
         # Identity captured at construction, not the per-turn HERMES_HOME-derived name.
         primary_profile = getattr(self, "_primary_profile_name", None)
         if not primary_profile:
@@ -235,26 +237,79 @@ class GatewayAuthorizationMixin:
         return self._primary_adapters() if profile_name == primary_profile else {}
 
     def _is_shared_bot_satellite(self, profile_name: str) -> bool:
-        """A served profile with NO adapter of its own that a ``profile_routes`` entry targets through the
+        """A served profile with no independent connector that a ``profile_routes`` entry targets through the
         default profile's bot: it drains through the primary's adapters (gateway/AGENTS.md). Its
-        ``_profile_adapters`` entry is the ``{}`` startup placeholder; a secondary connected on ANY
+        ``_profile_adapters`` entry is empty or LOCAL-only; a secondary connected on ANY messaging
         platform is its own credential boundary and never borrows the primary. Restored/cached sources
         carry no transport ref, so this is what keeps heartbeats, completions and goal notices for such a
         profile deliverable after a restart (the same rule ``kanban_watchers_notifier`` and cron apply)."""
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
             return False
+        return self._cron_shared_route_eligible(profile_name)
+
+    def _cron_shared_route_eligible(self, profile_name: str) -> bool:
+        """Cron visits secondary homes even when adapter multiplexing is disabled.
+
+        Keep exact route grants and independent connector ownership in both modes; the
+        gateway's satellite heuristic remains multiplex-only. Nonmultiplex startup does
+        not cache secondary configs, so read that home's actual scoped config instead.
+        """
+        config = getattr(self, "config", None)
         # A bot that failed to connect is queued for reconnect: that profile owns a credential.
         if (getattr(self, "_profile_failed_platforms", None) or {}).get(profile_name):
             return False
         routes = getattr(config, "profile_routes", None) or []
         if not any(r.enabled and r.profile == profile_name and r.bot_profile is None for r in routes):
             return False
-        from gateway.run import _multiplex_profile_homes
+        from gateway.run import _multiplex_profile_homes, _profile_runtime_scope
         try:
-            return profile_name in {name for name, _home in _multiplex_profile_homes(config)}
+            multiplex = getattr(config, "multiplex_profiles", False)
+            # Borrowable secondary homes use the served set; the ticker's extra active
+            # launch home is handled by its primary-adapter branch, outside this callback.
+            homes = dict(_multiplex_profile_homes(config))
+            if profile_name not in homes:
+                return False
+            profile_config = None
+            if not multiplex:
+                from gateway.config_loader import load_ownership_config
+                cached = (getattr(self, "_profile_configs", None) or {}).get(profile_name)
+                if cached is not None and self._profile_has_own_connector(profile_name, homes[profile_name], cached):
+                    return False  # Startup ownership survives terminal failure and damaged files.
+                with _profile_runtime_scope(homes[profile_name], prepared_secret_scope={}):
+                    profile_config = load_ownership_config(homes[profile_name])
+            return not self._profile_has_own_connector(profile_name, homes[profile_name], profile_config)
         except Exception:
+            logger.debug("Cron shared-route ownership unavailable for %s", profile_name, exc_info=True)
             return False
+
+    def _profile_has_own_connector(self, profile_name: str, home: Path, profile_config=None) -> bool:
+        """Startup-eligible own connectors retain ownership even after terminal connect failure.
+
+        Use startup's scoped config (or the cron caller's fresh scoped config), never ambient
+        credentials or key presence. Only multiplex startup skips shared ingress/listener mirrors.
+        """
+        from gateway.config import SHARED_LISTENER_MIRROR_PLATFORMS
+        from gateway.run import _platform_has_bot_credential, _profile_runtime_scope
+
+        if profile_config is None:
+            configs = getattr(self, "_profile_configs", None)
+            if configs is None:
+                # Preserve legacy empty-map holders; unsupported holders cannot gain LOCAL sharing.
+                return bool(self._profile_adapters_map().get(profile_name))
+            profile_config = configs.get(profile_name)
+            if profile_config is None:
+                return True  # Startup has not established this profile's ownership yet.
+        multiplex = getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        with _profile_runtime_scope(home, prepared_secret_scope={}):
+            return any(
+                platform is not Platform.LOCAL
+                and (not multiplex or (platform is not Platform.RELAY
+                                       and platform.value not in SHARED_LISTENER_MIRROR_PLATFORMS))
+                and platform_config.enabled
+                and _platform_has_bot_credential(platform, platform_config)
+                for platform, platform_config in profile_config.platforms.items()
+            )
 
     def _intake_adapter_for(self, source: Optional[SessionSource]):
         """The adapter that RECEIVED *source*'s event — the only one whose intake policy (ignored

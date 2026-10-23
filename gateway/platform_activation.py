@@ -97,13 +97,14 @@ def _legacy_gateway_json_names(home: Path) -> set[str]:
 
 def activation_predicate(
     *, yaml_cfg: Any = None, platform_names: Iterable[str] = (), home: Optional[Path] = None,
-    registry: Any = None,
+    registry: Any = None, env_names: Optional[Iterable[str]] = None,
 ) -> Callable[[str], bool]:
     """``name -> bool``: does this profile show evidence of configuring platform *name*?
 
     *yaml_cfg* is the loaded config.yaml layer (read from *home* when omitted), *platform_names*
     any already-merged platform keys (``GatewayConfig.platforms``). *home* defaults to the active
-    Hermes home.
+    Hermes home. An ownership caller may supply validated *env_names* alongside its
+    merged platform keys to avoid rereading the file layers for activation evidence.
     """
     if home is None:
         from hermes_constants import get_hermes_home
@@ -115,9 +116,10 @@ def activation_predicate(
         except Exception:
             logger.debug("platform activation: config.yaml unreadable", exc_info=True)
     blocks = _yaml_block_names(yaml_cfg) | {str(getattr(n, "value", n)) for n in platform_names}
-    if home is not None:
+    if env_names is None and home is not None:
         blocks |= _legacy_gateway_json_names(home)
-    env = _env_names(home)
+    # A validated ownership caller already supplied legacy platform keys and scoped env names.
+    env = _env_names(home) if env_names is None else env_names
     upper_env = {e.upper() for e in env}
     pools = _credential_pool_names(home)
 
