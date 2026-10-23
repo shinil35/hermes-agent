@@ -1,0 +1,79 @@
+name: Promote tested Hermes 0.22.3 ARM64
+
+on:
+  push:
+    branches: [hermes/arm64-publish-0.22.3]
+
+permissions: {}
+
+concurrency:
+  group: promote-tested-12506923397
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'shinil35/hermes-agent' && github.actor == 'shinil35' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/hermes/arm64-publish-0.22.3'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          repository: shinil35/hermes-agent
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+          sparse-checkout: scripts/arm64/promote_tested.py
+          sparse-checkout-cone-mode: false
+      - name: Validate successful fixed build and download its exact artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          rm -rf control/.git
+          gh api repos/shinil35/hermes-agent/actions/runs/39965914486/attempts/1 > run.json
+          gh api repos/shinil35/hermes-agent/actions/artifacts/12506923397 > artifact.json
+          python3 control/scripts/arm64/promote_tested.py metadata run.json artifact.json
+          gh api repos/shinil35/hermes-agent/actions/artifacts/12506923397/zip > tested.zip
+          unset GH_TOKEN
+          python3 control/scripts/arm64/promote_tested.py unpack tested.zip tested > validated.json
+          rm tested.zip
+      - name: Publish unchanged tested image and verify registry config digest
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          DOCKER_CONFIG: ${{ runner.temp }}/ghcr-auth
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r REVISION IMAGE_ID ARCHIVE_SHA < tested/identity.txt
+          echo "$ARCHIVE_SHA  tested/image.tar.gz" | sha256sum --check
+          docker load -i tested/image.tar.gz
+          test "$(docker image inspect hermes-arm64:candidate --format '{{.Id}}')" = "$IMAGE_ID"
+          test "$(docker image inspect hermes-arm64:candidate --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
+          test "$(docker image inspect hermes-arm64:candidate --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$REVISION"
+          test "$(docker image inspect hermes-arm64:candidate --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = https://github.com/shinil35/hermes-agent
+          test "$(docker image inspect hermes-arm64:candidate --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = 0.22.3+1
+          test "$(docker image inspect hermes-arm64:candidate --format '{{index .Config.Labels "io.hermes.run"}}')" = 39965914486.1
+          tag="ghcr.io/shinil35/hermes-agent:0.22.3-d5609112e083-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python3 control/scripts/arm64/promote_tested.py unused-tag "$tag"
+          trap 'docker logout ghcr.io >/dev/null 2>&1; rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u shinil35 --password-stdin
+          unset GHCR_TOKEN
+          docker tag "$IMAGE_ID" "$tag"
+          docker push "$tag"
+          digest="$(docker buildx imagetools inspect "$tag" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          reference="ghcr.io/shinil35/hermes-agent@$digest"
+          docker buildx imagetools inspect "$reference" --raw > manifest.json
+          test "$(python3 -c 'import json; print(json.load(open("manifest.json"))["config"]["digest"])')" = "$IMAGE_ID"
+          docker pull "$reference"
+          test "$(docker image inspect "$reference" --format '{{.Id}}')" = "$IMAGE_ID"
+          printf 'Image tag: `%s`\nTested digest: `%s`\nConfig ID: `%s`\nBrowser excluded; no deployment.\n' "$tag" "$reference" "$IMAGE_ID" >> "$GITHUB_STEP_SUMMARY"
