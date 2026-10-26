@@ -130,3 +130,27 @@ The `--until` judge routes through the `goal_judge` auxiliary task, so `auxiliar
 | **Lives in** | Your current session | Your current session | Its own session per run |
 | **Ends when** | Stop condition / caps / you | Goal achieved / budget / you | You remove the job |
 | **Best for** | Polling, monitoring, periodic re-runs | One objective, iterate until done | Unattended, long-horizon schedules |
+
+### Messaging route continuity
+
+Gateway loops retain the owning session key, workspace, thread and receiving bot's
+profile. The scanner restores the persisted origin before choosing an adapter or
+checking busy state. A due first tick waits while the setup turn holds that route
+or transcript lease; idle ticks enter the existing session authority FIFO.
+
+Older stored loops without workspace fields can recover from exactly one matching
+owning routing entry. An unavailable origin, conflicting workspace/thread/profile,
+ambiguous alias or disconnected owning adapter leaves the tick unclaimed. The
+scanner never selects a workspace from the connected bot roster. Recreate the loop
+in its original conversation if its old ownership evidence is no longer available.
+
+Tick completions carry their loop incarnation and tick identity through the existing
+admission envelope. Human/setup turns and completions of replaced loops cannot settle
+a newer tick. Tick writes compare the persisted state, so pause, stop or replacement
+wins over a delayed completion/judge or failed-injection refund. A refused injection
+refunds its provisional count and keeps the existing retry delay.
+
+This does not add restart reconciliation for ticks already awaiting a response when
+the process died, nor cancel model work already admitted before a user control. A
+pre-upgrade queued tick has no incarnation identity; it cannot settle a new loop.
+Live Slack recurrence and browser automation require separate runtime validation.

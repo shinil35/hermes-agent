@@ -366,12 +366,12 @@ class GatewayGoalsMixin:
             return
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
-        hooks = [("loop completion", self._post_turn_loop_completion)]
+        hooks = [("loop completion", self._post_turn_loop_completion, {"event": event})]
         if final_text.strip():
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
-        for label, hook in hooks:
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, {}))
+        for label, hook, extra in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                await hook(session_entry=session_entry, source=source, final_response=final_text, **extra)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
         self._publish_local_control(source, only_if_present=True)
@@ -400,7 +400,7 @@ class GatewayGoalsMixin:
         return streamed if isinstance(streamed, str) and streamed.strip() else text
 
     async def _post_turn_loop_completion(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
@@ -413,6 +413,10 @@ class GatewayGoalsMixin:
         state = mgr.state if mgr is not None else None
         if state is None or not state.awaiting_response:
             return
+        if event is not None:
+            from gateway.loop_routes import is_loop_tick_event
+            if not is_loop_tick_event(event, state, self._session_key_for_source(source)):
+                return
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
@@ -425,50 +429,32 @@ class GatewayGoalsMixin:
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
     ) -> None:
         """Inject one due /loop wakeup into its session, applying every deferral rule. ``profile`` is
-        the store being scanned (None = default); a ``profile`` persisted in the route wins."""
+        the owning store being scanned (None = launch profile); route hints must agree."""
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
 
-        if state.awaiting_response or now < state.next_due_at:
+        if state.status != "active" or state.awaiting_response or now < state.next_due_at:
             return
-        route = state.route or {}
-        platform_name = route.get("platform", "")
-        chat_id = route.get("chat_id", "")
-        if not platform_name or not chat_id:
-            return  # CLI / TUI-owned loop — their own schedulers drive it.
-        profile = route.get("profile") or profile
-        # The loop's OWN profile's adapter map, fail closed: ``self.adapters`` is the default profile's,
-        # so a secondary session's wakeup would inject via the default bot on a bare chat_id (a
-        # Telegram DM lands in the user's chat with the other bot).
-        adapters = self._adapters_for_profile(profile)
-        adapter = next((a for p, a in adapters.items() if p.value == platform_name), None)
-        if adapter is None:
+        from gateway.loop_routes import resolve_loop_route
+        try:
+            resolved = await self._run_in_executor_with_context(
+                resolve_loop_route, self, sid, state.route, profile)
+        except Exception as exc:
+            logger.warning("loop wakeup route unavailable for %s: %s", sid, exc, exc_info=True)
+            return
+        if resolved is None:
             if sid not in warned_no_route:
                 warned_no_route.add(sid)
-                logger.debug(
-                    "loop wakeup: no adapter for platform %r (session %s, profile %s)", platform_name, sid, profile,
-                )
+                logger.warning("loop wakeup has no unambiguous owning route for %s", sid)
             return
-
-        source = self._build_process_event_source({
-            "session_key": "",
-            "platform": platform_name,
-            "chat_id": chat_id,
-            **{k: route.get(k, "") for k in ("chat_type", "thread_id", "user_id", "user_name")},
-        })
-        if source is None:
-            return
-        if profile and not getattr(source, "profile", None):
-            source.profile = profile  # session key + runtime scope of the injected turn
-        session_key = None
-        with suppress(Exception):
-            session_key = self._session_key_for_source(source)
-        if session_key and session_key in self._running_agents:
-            return  # busy — stays due, next scan retries
+        source, session_key, adapter = resolved
+        platform_name = source.platform.value
+        if session_key in self._running_agents or self._turn_leases.is_busy(sid):
+            return  # stays due; never wait on the setup turn's transcript lease
         if goal_blocks_loop_tick(sid):
             return
 
-        mgr = LoopManager(session_id=sid)
-        if not mgr.is_due(now):
+        mgr = await self._run_in_executor_with_context(LoopManager, sid)
+        if mgr.state is None or mgr.state.to_json() != state.to_json() or not mgr.is_due(now):
             return
         from agent.estop import check_paused
 
@@ -482,22 +468,14 @@ class GatewayGoalsMixin:
         wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
         if not wakeup:
             return
-        # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
-        # surface. Persist the completion as a durable delivery row — never self-post it as a new role=user
-        # prompt.
-        # #85957: same client-owns-the-turn rule as the raw-key branch above — persist the completion as a
-        # delivery row, never self-post it as a new role=user prompt.
         try:
             logger.info(
                 "loop wakeup #%s — injecting for %s chat=%s thread=%s",
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            from gateway.session_automation import admit_route_wake
-            # Under a session authority the tick commits to the FIFO (never a classic turn beside an
-            # admitted one); a slash-command loop is a command and keeps the command path.
-            if wakeup.lstrip().startswith("/") or not await admit_route_wake(self, adapter, source, wakeup, "loop-tick"):
-                await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
+            from gateway.loop_routes import dispatch_loop_tick
+            await dispatch_loop_tick(self, adapter, source, session_key, sid, mgr.state, wakeup)
             # Slash-command loops dispatch through the command path and never hit the post-turn
             # completion hook — complete the tick immediately (caps + scheduling).
             if wakeup.lstrip().startswith("/"):
@@ -505,7 +483,7 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
             with suppress(Exception):
-                mgr.abandon_tick()
+                await self._run_in_executor_with_context(mgr.abandon_tick)
         # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
         self._publish_local_control(source)
 
