@@ -13,16 +13,16 @@ from scripts.arm64 import promote_tested as promotion
 @pytest.fixture
 def metadata():
     run = {"id": promotion.RUN_ID, "run_attempt": 1, "workflow_id": 394103165,
-           "head_sha": promotion.BUILD_HEAD, "head_branch": "hermes/arm64-packaging",
-           "event": "pull_request", "status": "completed", "conclusion": "success",
+           "head_sha": promotion.BUILD_HEAD, "head_branch": "hermes/arm64-slack-loop-build-0.22.3",
+           "event": "push", "status": "completed", "conclusion": "success",
            "path": ".github/workflows/arm64-downstream.yml",
            "repository": {"full_name": promotion.REPOSITORY},
            "head_repository": {"full_name": promotion.REPOSITORY}}
-    artifact = {"id": promotion.ARTIFACT_ID, "name": "tested-arm64-39965914486-1",
+    artifact = {"id": promotion.ARTIFACT_ID, "name": "tested-arm64-40420109138-1",
                 "expired": False, "digest": "sha256:" + promotion.ZIP_SHA,
                 "workflow_run": {"id": promotion.RUN_ID, "repository_id": 1430649011,
                                  "head_repository_id": 1430649011, "head_sha": promotion.BUILD_HEAD,
-                                 "head_branch": "hermes/arm64-packaging"}}
+                                 "head_branch": "hermes/arm64-slack-loop-build-0.22.3"}}
     return run, artifact
 
 
@@ -32,7 +32,7 @@ def test_fixed_successful_build_metadata(metadata):
 
 @pytest.mark.parametrize("field,value", [
     ("id", 1), ("run_attempt", 2), ("workflow_id", 1), ("head_sha", promotion.SOURCE),
-    ("event", "push"), ("status", "in_progress"), ("conclusion", "failure"),
+    ("event", "pull_request"), ("status", "in_progress"), ("conclusion", "failure"),
     ("path", ".github/workflows/other.yml"), ("head_branch", "main"),
     ("head_repository", {"full_name": "other/hermes-agent"}),
 ])
@@ -107,7 +107,7 @@ def test_only_registry_manifest_absence_allows_new_tag(monkeypatch, status):
         return io.BytesIO(b"")
 
     monkeypatch.setattr(promotion.urllib.request, "urlopen", urlopen)
-    tag = "ghcr.io/shinil35/hermes-agent:0.22.3-d5609112e083-12345-1"
+    tag = "ghcr.io/shinil35/hermes-agent:0.22.3-439e5888802a-12345-1"
     if status == 404:
         promotion.require_unused_tag(tag)
     else:

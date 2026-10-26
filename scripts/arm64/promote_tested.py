@@ -13,11 +13,11 @@ import urllib.request
 import zipfile
 
 REPOSITORY = "shinil35/hermes-agent"
-SOURCE = "d5609112e083da74d31803e1b248bb02a33f342d"
-BUILD_HEAD = "6d3a56cf4ae7b50026045368cbe69b1be0e4b63f"
-RUN_ID = 39965914486
-ARTIFACT_ID = 12506923397
-ZIP_SHA = "c35b3de72a82fdd68680be2b4bdf8fa0b8cfe4cb7c897af2167d1449fa1a8092"
+SOURCE = "439e5888802a3ee5b5432b902bcd14d53054e996"
+BUILD_HEAD = "8436b236081145c21fb99a1cd465d9de2f215c4e"
+RUN_ID = 40420109138
+ARTIFACT_ID = 12697004355
+ZIP_SHA = "25a8256b2fe1a00333cb592c8a701281b9139d727db5211a65c113136d188bed"
 
 
 def _match(actual, expected):
@@ -28,16 +28,16 @@ def _match(actual, expected):
 
 def validate_metadata(run, artifact):
     _match(run, {"id": RUN_ID, "run_attempt": 1, "workflow_id": 394103165,
-                 "head_sha": BUILD_HEAD, "head_branch": "hermes/arm64-packaging",
-                 "event": "pull_request", "status": "completed", "conclusion": "success",
+                 "head_sha": BUILD_HEAD, "head_branch": "hermes/arm64-slack-loop-build-0.22.3",
+                 "event": "push", "status": "completed", "conclusion": "success",
                  "path": ".github/workflows/arm64-downstream.yml"})
     for key in ("repository", "head_repository"):
         _match(run.get(key, {}), {"full_name": REPOSITORY})
-    _match(artifact, {"id": ARTIFACT_ID, "name": "tested-arm64-39965914486-1",
+    _match(artifact, {"id": ARTIFACT_ID, "name": "tested-arm64-40420109138-1",
                       "expired": False, "digest": "sha256:" + ZIP_SHA})
     _match(artifact.get("workflow_run", {}), {
         "id": RUN_ID, "repository_id": 1430649011, "head_repository_id": 1430649011,
-        "head_sha": BUILD_HEAD, "head_branch": "hermes/arm64-packaging"})
+        "head_sha": BUILD_HEAD, "head_branch": "hermes/arm64-slack-loop-build-0.22.3"})
 
 
 def _digest(path):
@@ -78,7 +78,7 @@ def unpack_verified(archive, destination):
 
 
 def require_unused_tag(tag):
-    if not re.fullmatch(r"ghcr.io/shinil35/hermes-agent:0\.22\.3-d5609112e083-[0-9]+-[0-9]+", tag):
+    if not re.fullmatch(r"ghcr.io/shinil35/hermes-agent:0\.22\.3-439e5888802a-[0-9]+-[0-9]+", tag):
         raise ValueError("Unexpected publication tag")
     credentials = base64.b64encode(("shinil35:" + os.environ["GHCR_TOKEN"]).encode()).decode()
     request = urllib.request.Request(
