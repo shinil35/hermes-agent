@@ -1,99 +1,55 @@
-# Fork ARM64 candidate
+# Fork ARM64 Slack loop candidate
 
-This workflow belongs exclusively to shinil35/hermes-agent. No upstream PR,
-main push/merge, release tag or deployment is part of this change.
+This control branch belongs exclusively to shinil35/hermes-agent. The application
+is the immutable commit in `scripts/arm64/source-revision`, descended from installed
+0.22.3 at 5b147ab036d6d19131bff8d20701b5001eab844a and retaining the d560 LOCAL-only
+satellite repair. Packaging-main application files never enter the image.
 
-Application code is the reviewed immutable SHA selected in
-scripts/arm64/source-revision (PR validation), or the owner's full source_sha
-input (future manual dispatch). It must descend from the installed 0.22.3
-baseline 5b147ab036d6d19131bff8d20701b5001eab844a. The current pin is the
-independently approved source-patch commit d5609112e083da74d31803e1b248bb02a33f342d.
-The required source tests are present in that committed tree; packaging
-validation uses this source commit rather than the packaging/control revision.
-Newer packaging-main application files are never imported into the image.
+The source PR uses `hermes/0.22.3-slack-loop-fix` against `hermes/arm64-preflight`.
+No main write, merge, upstream PR or deployment is required. Independent review was
+waived by the owner for this assignment; regression tests and smoke remain required.
 
-## Branch-safe review topology
+## Build and exact-image promotion
 
-After independent review and a separate publication assignment:
+A path-filtered push to the new `hermes/arm64-slack-loop-build-0.22.3` branch runs
+the read-only build job on hosted `ubuntu-24.04-arm`. It accepts only the committed
+source pin, fetches public source without credentials, and removes checkout metadata
+before running selected source. Every named test file is verified at the pinned
+commit. The loop/admission regression inventory extends the existing LOCAL/shared
+route, ownership-failure, multiplex and durable-delivery tests. `scripts/check`
+compares against the installed baseline. All gates precede one native ARM64 build.
 
-- Push baseline ref hermes/0.22.3-base at the exact installed baseline.
-- Commit/push hermes/arm64-preflight; open a **fork-only** PR with head
-  hermes/arm64-preflight and base hermes/0.22.3-base in shinil35/hermes-agent.
-  This keeps the source PR small and never upgrades main to an older tree.
-- Commit/push hermes/arm64-packaging after pinning the reviewed source commit;
-  open a **fork-only** PR against main. Its pull_request workflow tests/builds
-  that exact public fork source with a read-only token. It cannot publish.
+Dependency/test state lives under the runner's temporary directory. The Docker
+context is a fresh Git archive plus schema-2 install stamp, with exact source,
+version and build-run labels. No host state, Git credentials or real messaging
+secrets enter the context. Dockerfile, PM dependencies and browser provisioning
+remain unchanged.
 
-These branch names do not match inherited main-only/wine2e push triggers.
-Inherited generic PR workflows may run; their ordinary Docker publisher has
-an upstream repository guard. Do not dispatch inherited releases. Inventory
-before the later push must recheck current workflow metadata and automatic
-publisher triggers. Current read-only fork metadata returned zero registered
-workflows; that does not prove Actions access or disabled publisher settings.
-No repository settings are changed by this candidate.
+Smoke runs offline with disposable state: startup/version, UID 10000, exact stamp,
+core imports/SQLite, sealed code/store access and persistence across recreation.
+The image is saved only after smoke succeeds. Its receipt records application SHA,
+config/image ID and compressed archive hash. The artifact ZIP has its own Actions
+digest, distinct from the archive, config ID and eventual registry manifest digest.
 
-New workflow_dispatch files normally need to exist on the default branch.
-A PR-head pull_request run can validate this candidate without a main write,
-subject to fork Actions policy/approval. There is no supported existing fork
-dispatch path demonstrated here. Manual publication stays unavailable until
-an owner independently merges/installs the reviewed workflow on default main;
-this agent will not merge or push main. The publish job additionally requires
-manual dispatch on main and publish=true (default false). PR artifacts never
-trigger the packages-write job. No workflow_run publisher is added.
+After successful build, a separate path-filtered owner-branch publisher pins that
+run, attempt, control head, artifact ID and ZIP digest. It validates completed-success
+metadata and fork identity, ZIP layout/CRC/checksum, receipt/source/archive checksums,
+loaded config ID, platform and source/version/build labels. Its packages-write job
+executes only trusted control code; it never executes selected application code or
+rebuilds the container. It refuses an existing publication tag and publishes a new
+`0.22.3-<source12>-<publisherRun>-<attempt>` tag, then verifies registry config identity
+and performs a full digest pull on the runner. Changes to publisher pins do not
+trigger another build. Existing branches, PRs, images and tags remain unchanged.
 
-## Tests, image identity and credentials
+## Limits and visibility
 
-Actions are SHA-pinned. Public HTTPS Git source fetch is credentialless and
-checkout credentials are not persisted. Selected code runs only after control
-credentials/metadata are removed. Dependency/test state is runner-temporary.
-The image context is a fresh git archive plus explicit install stamp; neither
-Git metadata, deploy keys nor host runtime state is copied. PM versions,
-dependencies and Dockerfile are unchanged. The inherited image-provenance
-marker still names nousresearch/hermes-agent; OCI source labels and exact
-revision stamp identify this downstream build without claiming that marker
-was corrected.
+Browser provisioning/navigation, agent-browser and PM repair are excluded. Presence
+is diagnostic, never browser acceptance. Live Slack recurrence still needs an owner
+test; offline admission and model-boundary fixtures do not prove live delivery.
+No deployment, reload, restart or production configuration/database write occurs.
 
-The required 22-file source regression lane covers adapter/identity behavior,
-scoped ownership read failures, nonmultiplex routing, bridge compatibility and
-durable delivery/restart workers. This full lane and scripts/check precede a single native
-linux/arm64 Docker build on ubuntu-24.04-arm. Two test workers and a 120-minute
-job timeout bound execution. Official runner documentation lists 4 CPUs,
-16 GB RAM and 14 GB SSD for public ARM Linux runners; actual queue access,
-Docker/buildx and disk peak remain execution gates. Resource exhaustion
-fails the job; there is no emulation or third-party runner fallback.
-
-The smoke gates architecture, exact schema-2 stamp, service UID 10000,
-entrypoint --version, core imports/SQLite, sealed code/store access and
-persistent-state recreation. Root only initializes ownership of the test
-volume. It runs without external networking or model/platform secrets.
-The built image is archived after checks. A fresh publisher loads the same
-archive, verifies archive hash/config ID and source label, pushes only a
-revision/run/attempt tag, checks registry manifest config digest and pulls
-by digest. No rebuild, latest tag, source execution or deployment occurs in
-the publisher. Tags are unique per run/attempt; deployment would use digest
-under a separate future authorization.
-
-## Known excluded browser limitation
-
-Adapter-only delivery explicitly excludes browser provisioning, PM repairs
-and browser navigation acceptance. Chromium is staged by the baseline but
-agent-browser is not explicitly provisioned; service-UID lazy installation
-may fail against the sealed PM store. Smoke records presence diagnostically
-and prints browser EXCLUDED, never browser passed. It does not install a
-helper, change permissions/versions or claim offline navigation/extraction.
-A local PM repair is not assumed to survive image recreation. This known gap
-does not indefinitely block the explicitly authorized adapter-only image.
-
-## Future package visibility
-
-The proposed package ghcr.io/shinil35/hermes-agent has not been verified
-available/linked. After authorized opt-in publication, owner package Settings
-can change initial private visibility to Public; anonymous digest pull is
-required before claiming public delivery. Public intent is approved; no
-registry/settings writes occur during candidate preparation. GITHUB_TOKEN
-packages write is confined to the manual publisher. No deploy key enters CI.
-
-References: upstream repair PR https://github.com/NousResearch/hermes-agent/pull/139960
-(liuhao1024; MIT; source adaptation cites both commits); GitHub documentation:
-https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow
-and https://docs.github.com/en/actions/reference/runners/github-hosted-runners .
+The registry readback independently requests anonymous manifest and config access.
+That evidence is separate from an authenticated full layer pull on Actions. A package
+metadata API denial does not establish private visibility; no package setting or
+visibility is changed by this workflow. The earlier d560 image remains available
+as the existing rollback reference, without claiming it fixes Slack loop scope.

@@ -29,7 +29,8 @@ def main() -> None:
     assert platform.machine() in {"aarch64", "arm64"}
     root = Path("/opt/hermes")
     check_stamp(json.loads((root / "install-stamp.json").read_text(encoding="utf-8-sig")), sys.argv[1])
-    for name in ("gateway.config", "cron.scheduler_preflight", "hermes_cli.version_info"):
+    for name in ("gateway.config", "gateway.loop_routes", "hermes_cli.loops_state",
+                 "cron.scheduler_preflight", "hermes_cli.version_info"):
         importlib.import_module(name)
     with sqlite3.connect(":memory:") as connection:
         assert connection.execute("select 2+2").fetchone()[0] == 4
