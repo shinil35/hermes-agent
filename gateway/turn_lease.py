@@ -79,6 +79,11 @@ class SessionTurnLeaseRegistry:
         self._leases: dict[str, _SessionLease] = {}
         self._max_entries = max(1, int(max_entries))
 
+    def is_busy(self, session_id: str) -> bool:
+        """Whether this transcript is held or has a pending acquire, without taking a lease."""
+        lease = self._leases.get(session_id)
+        return lease is not None and not lease.idle
+
     def _get_or_create(self, session_id: str) -> _SessionLease:
         if (lease := self._leases.get(session_id)) is None:
             self._evict_idle()

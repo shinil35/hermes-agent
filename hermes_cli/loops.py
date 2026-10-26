@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -177,6 +178,8 @@ class LoopState:
     """Serializable /loop state stored per session."""
 
     prompt: str
+    loop_id: str = ""
+    tick_id: str = ""
     status: str = "active"            # active | paused | done | cleared
     mode: str = "interval"            # interval | self_paced
     interval_seconds: float = 0.0     # fixed cadence (mode == "interval")
@@ -383,6 +386,11 @@ def _digest_response(response: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
+def tick_identity(state: LoopState) -> str:
+    """Stable identity of this loop incarnation and claimed tick, carried by the wake event."""
+    return f"{state.loop_id}:{state.tick_id}"
+
+
 class LoopManager:
     """Per-session /loop state + tick decisions.
 
@@ -394,6 +402,7 @@ class LoopManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._state: Optional[LoopState] = load_loop(session_id)
+        self._loaded_json = self._state.to_json() if self._state is not None else None
 
     @property
     def state(self) -> Optional[LoopState]:
@@ -402,6 +411,7 @@ class LoopManager:
     def refresh(self) -> None:
         """Re-read state from the DB (cross-process safety for the gateway)."""
         self._state = load_loop(self.session_id)
+        self._loaded_json = self._state.to_json() if self._state is not None else None
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
@@ -411,7 +421,20 @@ class LoopManager:
 
     def _save(self) -> LoopState:
         save_loop(self.session_id, self._state)
+        self._loaded_json = self._state.to_json()
         return self._state
+
+    def _save_tick(self) -> bool:
+        from hermes_cli.loops_state import save_current_tick
+        if not save_current_tick(self.session_id, self._state, self._loaded_json):
+            self.refresh()
+            return False
+        self._loaded_json = self._state.to_json()
+        return True
+
+    def _no_tick(self) -> dict[str, Any]:
+        return {"status": self._state.status if self._state else None, "stopped": False,
+                "reason": "no tick in flight", "message": ""}
 
     def status_line(self) -> str:
         s = self._state
@@ -456,6 +479,7 @@ class LoopManager:
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
         state = LoopState(
             prompt=prompt,
+            loop_id=uuid.uuid4().hex,
             mode="self_paced" if self_paced else "interval",
             interval_seconds=interval,
             current_delay=float(self_paced_floor_seconds()) if self_paced else interval,
@@ -513,12 +537,14 @@ class LoopManager:
         if s is None or not self.is_due():
             return None
         s.ticks_fired += 1
+        s.tick_id = uuid.uuid4().hex
         s.last_fired_at = time.time()
         s.awaiting_response = True
         # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
         # process dies mid-turn this keeps the persisted loop from being 'due' in a tight loop.
         s.next_due_at = s.last_fired_at + (s.current_delay or s.interval_seconds or self_paced_floor_seconds())
-        self._save()
+        if not self._save_tick():
+            return None
 
         if s.prompt.lstrip().startswith("/"):
             return s.prompt.strip()
@@ -533,7 +559,7 @@ class LoopManager:
             return
         s.awaiting_response = False
         s.ticks_fired = max(0, s.ticks_fired - 1)
-        self._save()
+        self._save_tick()
 
     def _stop(self, status: str, reason: str, message: str) -> dict[str, Any]:
         """Persist a terminal (``done``) or recoverable (``paused``) stop and build the result."""
@@ -543,7 +569,8 @@ class LoopManager:
             s.last_stop_reason = reason
         else:
             s.paused_reason = reason
-        self._save()
+        if not self._save_tick():
+            return self._no_tick()
         return {"status": status, "stopped": True, "reason": reason, "message": message}
 
     def complete_tick(self, last_response: str) -> dict[str, Any]:
@@ -606,7 +633,8 @@ class LoopManager:
         else:
             s.current_delay = s.interval_seconds
         s.next_due_at = now + s.current_delay
-        self._save()
+        if not self._save_tick():
+            return self._no_tick()
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
 
 

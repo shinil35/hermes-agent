@@ -25,7 +25,17 @@ class _FakeSessionStore:
         self.entry = _FakeSessionEntry()
 
     def get_or_create_session(self, source, *, touch_activity=True):
+        self.entry.origin = source
+        self.entry.session_key = self._generate_session_key(source)
+        self.entry.suspended = False
+        self.entry.transport_profile = None
         return self.entry
+
+    def list_sessions(self):
+        return [self.entry]
+
+    def peek_session_id(self, key):
+        return self.entry.session_id if key == self.entry.session_key else None
 
     def _generate_session_key(self, source):
         return "agent:main:discord:channel:loop-test"
@@ -255,11 +265,11 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
             self.handled.append(event.text)
 
     runner.adapters = {Platform.DISCORD: _Adapter()}
-    runner._build_process_event_source = lambda evt: SimpleNamespace(
-        platform=Platform.DISCORD, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
-        thread_id=evt["thread_id"] or None, user_id=evt["user_id"], user_name=evt["user_name"],
-    )
-    runner._session_key_for_source = lambda source: "agent:main:discord:channel:chat-loop"
+    runner._restored_source = lambda entry: entry.origin
+    runner._session_key_for_source = runner.session_store._generate_session_key
+    runner._adapter_for_source = lambda source: runner.adapters[Platform.DISCORD]
+    from gateway.turn_lease import SessionTurnLeaseRegistry
+    runner._turn_leases = SessionTurnLeaseRegistry()
 
     # A slash-command loop that is due now.
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m /status"))

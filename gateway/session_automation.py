@@ -652,7 +652,7 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     return entry, release
 
 
-async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):
+async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, *, wake_id=None, expected_session_id=None):
     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
     authority FIFO, like heartbeats and process completions, instead of a classic turn that
     interrupts or races the admitted one. ``False`` when no authority serves the scope or the
@@ -662,10 +662,14 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
     authority = active_authority(runner)
     key = runner._session_key_for_source(source)
     entry = runner.session_store.lookup_by_session_key(key) if authority is not None else None
+    if expected_session_id is not None:
+        current = entry if authority is not None else runner.session_store.lookup_by_session_key(key)
+        if current is None or current.session_id != expected_session_id or current.suspended:
+            raise RuntimeStoreError('admission_conflict')
     if authority is None or entry is None:
         return False
     import uuid
-    identity = json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
+    identity = json.dumps([producer, key, wake_id or uuid.uuid4().hex], separators=(',', ':'))
     if source.platform == Platform.LOCAL:
         # A local route has no messaging provenance to borrow: its wake rides local_automation_v1 on
         # the live session's own source object (``snapshot_local_automation`` checks identity).
